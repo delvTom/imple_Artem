@@ -9,7 +9,7 @@ def calculate_r2_score(x: torch.Tensor, y: torch.Tensor) -> float:
     averaged over the batch.
     
     Args:
-        x: Ground truth images (or reference), shape (N, ...)
+        x: Ground truth images (or reference), shape (N, ...)  # Typo ? X = predicted et Y = True ?
         y: Predicted images, shape (N, ...)
         
     Returns:
