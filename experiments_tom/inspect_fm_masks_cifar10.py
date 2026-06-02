@@ -16,6 +16,13 @@ from local_diffusion.utils.wiener import (
 )
 
 
+def image_to_display(img):
+    img = img[0].detach().cpu()
+    img = (img + 1.0) / 2.0
+    img = img.clamp(0, 1)
+    return img.permute(1, 2, 0)
+
+
 def plot_xt_trajectory_grid(x0_batch, x1_batch, q_positions, t_values, out_path):
     n_rows = x1_batch.shape[0]
     n_cols = len(t_values) + 2
@@ -40,9 +47,8 @@ def plot_xt_trajectory_grid(x0_batch, x1_batch, q_positions, t_values, out_path)
 
         for c, (title, img) in enumerate(panels):
             ax = axes[r, c]
-            img = img[0, 0].detach().cpu()
 
-            ax.imshow(img, cmap="gray", vmin=-1, vmax=1)
+            ax.imshow(image_to_display(img))
             ax.scatter([qx], [qy], c="red", s=18)
             ax.set_xticks([])
             ax.set_yticks([])
@@ -89,13 +95,12 @@ def plot_field_on_xt_grid(
         for c, t in enumerate(t_values):
             ax = axes[r, c]
             xt = (1.0 - t) * x0_batch[r : r + 1] + t * x1_batch[r : r + 1]
-            x_bg = xt[0, 0].detach().cpu()
             field_q = fields_by_img_t[(r, c)]
             if mask_zeros:
                 field_q = field_q.clone()
                 field_q[field_q <= 0] = torch.nan
 
-            ax.imshow(x_bg, cmap="gray", vmin=-1, vmax=1)
+            ax.imshow(image_to_display(xt))
             ax.imshow(field_q, cmap=cmap, alpha=alpha, vmin=0, vmax=1)
             ax.scatter([qx], [qy], c="red", s=18)
 
@@ -154,7 +159,7 @@ def plot_sensitivity_heatmap_grid(
     plt.close(fig)
 
 
-def build_fm_mask(U, LA, Vh, t, threshold=0.005, eps=1e-6):
+def build_fm_mask(U, LA, Vh, t, threshold=0.02, eps=1e-6):
     sigma2 = ((1.0 - t) / t) ** 2
 
     shrink = LA / (LA + sigma2)
@@ -168,12 +173,18 @@ def build_fm_mask(U, LA, Vh, t, threshold=0.005, eps=1e-6):
     return mask, normalized
 
 
+def spatial_field_for_q(field, qy, qx, channels, height, width):
+    q_rows = [ch * height * width + qy * width + qx for ch in range(channels)]
+    field_q = field[q_rows].abs().reshape(channels, channels, height, width)
+    return field_q.amax(dim=(0, 1)).detach().cpu()
+
+
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("device:", device)
 
     cfg = load_config(
-        "configs/wiener/mnist.yaml",
+        "configs/wiener/cifar10.yaml",
         overrides=[
             "metrics.wandb.enabled=false",
             "dataset.batch_size=512",
@@ -181,7 +192,7 @@ def main():
     )
 
     dataset = build_dataset(cfg.dataset)
-    wiener_path = Path("data/models/wiener/mnist_28")
+    wiener_path = Path("data/models/wiener/cifar10_32")
 
     if (wiener_path / "U.pt").exists():
         print("Loading existing Wiener SVD...")
@@ -213,15 +224,15 @@ def main():
 
     q_positions = [
         (H // 2, W // 2),
-        (H // 2 - 5, W // 2),
-        (H // 2 + 5, W // 2),
-        (H // 2, W // 2 - 5),
-        (H // 2, W // 2 + 5),
+        (H // 2 - 6, W // 2),
+        (H // 2 + 6, W // 2),
+        (H // 2, W // 2 - 6),
+        (H // 2, W // 2 + 6),
     ]
 
     t_values = [0.1, 0.3, 0.5, 0.7, 0.9]
 
-    out_dir = Path("experiments_tom/figures/fm_masks_mnist")
+    out_dir = Path("experiments_tom/figures/fm_masks_cifar10")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     plot_xt_trajectory_grid(
@@ -239,10 +250,8 @@ def main():
         mask, normalized = build_fm_mask(U, LA, Vh, t)
 
         for r, (qy, qx) in enumerate(q_positions):
-            q = qy * W + qx
-
-            mask_q = mask[q].reshape(C, H, W)[0].detach().cpu()
-            sens_q = normalized[q].abs().reshape(C, H, W)[0].detach().cpu()
+            mask_q = spatial_field_for_q(mask, qy, qx, C, H, W)
+            sens_q = spatial_field_for_q(normalized, qy, qx, C, H, W)
             sens_q = sens_q / (sens_q.max() + 1e-8)
 
             masks_by_img_t[(r, c)] = mask_q
@@ -250,7 +259,7 @@ def main():
 
             print(
                 f"t={t:.2f} | img={r} | q=({qy},{qx}) | "
-                f"active pixels={int(mask_q.sum().item())}"
+                f"active spatial pixels={int(mask_q.sum().item())}"
             )
 
     plot_sensitivity_heatmap_grid(

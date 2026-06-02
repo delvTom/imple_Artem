@@ -1,0 +1,278 @@
+from pathlib import Path
+import os
+
+import torch
+
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib-cache")
+
+import matplotlib.pyplot as plt
+
+from local_diffusion.configuration import load_config
+from local_diffusion.data import build_dataset
+from local_diffusion.utils.wiener import (
+    compute_wiener_filter,
+    load_wiener_filter,
+    save_wiener_filter,
+)
+
+
+def plot_xt_trajectory_grid(x0_batch, x1_batch, q_positions, t_values, out_path):
+    n_rows = x1_batch.shape[0]
+    n_cols = len(t_values) + 2
+
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(2.4 * n_cols, 2.35 * n_rows),
+    )
+
+    if n_rows == 1:
+        axes = axes[None, :]
+
+    for r in range(n_rows):
+        qy, qx = q_positions[r]
+        panels = [("x0 noise", x0_batch[r : r + 1])]
+        panels += [
+            (f"t={t:.2f}", (1.0 - t) * x0_batch[r : r + 1] + t * x1_batch[r : r + 1])
+            for t in t_values
+        ]
+        panels += [("x1 data", x1_batch[r : r + 1])]
+
+        for c, (title, img) in enumerate(panels):
+            ax = axes[r, c]
+            img = img[0, 0].detach().cpu()
+
+            ax.imshow(img, cmap="gray", vmin=-1, vmax=1)
+            ax.scatter([qx], [qy], c="red", s=18)
+            ax.set_xticks([])
+            ax.set_yticks([])
+
+            if r == 0:
+                ax.set_title(title, fontsize=11)
+            if c == 0:
+                ax.set_ylabel(f"img {r}, q=({qy},{qx})", fontsize=9)
+
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=250)
+    plt.close(fig)
+
+
+def plot_field_on_xt_grid(
+    x0_batch,
+    x1_batch,
+    fields_by_img_t,
+    q_positions,
+    t_values,
+    out_path,
+    *,
+    cmap="viridis",
+    alpha=0.85,
+    mask_zeros=False,
+):
+    n_rows = x1_batch.shape[0]
+    n_cols = len(t_values)
+
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(2.5 * n_cols, 2.45 * n_rows),
+    )
+
+    if n_rows == 1:
+        axes = axes[None, :]
+    if n_cols == 1:
+        axes = axes[:, None]
+
+    for r in range(n_rows):
+        qy, qx = q_positions[r]
+
+        for c, t in enumerate(t_values):
+            ax = axes[r, c]
+            xt = (1.0 - t) * x0_batch[r : r + 1] + t * x1_batch[r : r + 1]
+            x_bg = xt[0, 0].detach().cpu()
+            field_q = fields_by_img_t[(r, c)]
+            if mask_zeros:
+                field_q = field_q.clone()
+                field_q[field_q <= 0] = torch.nan
+
+            ax.imshow(x_bg, cmap="gray", vmin=-1, vmax=1)
+            ax.imshow(field_q, cmap=cmap, alpha=alpha, vmin=0, vmax=1)
+            ax.scatter([qx], [qy], c="red", s=18)
+
+            ax.set_xticks([])
+            ax.set_yticks([])
+
+            if r == 0:
+                ax.set_title(f"t={t:.2f}", fontsize=12)
+            if c == 0:
+                ax.set_ylabel(f"img {r}, q=({qy},{qx})", fontsize=9)
+
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=250)
+    plt.close(fig)
+
+
+def plot_sensitivity_heatmap_grid(
+    fields_by_img_t,
+    q_positions,
+    t_values,
+    out_path,
+    *,
+    cmap="turbo",
+):
+    n_rows = len(q_positions)
+    n_cols = len(t_values)
+
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(2.5 * n_cols, 2.45 * n_rows),
+    )
+
+    if n_rows == 1:
+        axes = axes[None, :]
+    if n_cols == 1:
+        axes = axes[:, None]
+
+    for r, (qy, qx) in enumerate(q_positions):
+        for c, t in enumerate(t_values):
+            ax = axes[r, c]
+            field_q = fields_by_img_t[(r, c)]
+
+            ax.imshow(field_q, cmap=cmap, vmin=0, vmax=1, interpolation="nearest")
+            ax.scatter([qx], [qy], c="red", s=18)
+            ax.set_xticks([])
+            ax.set_yticks([])
+
+            if r == 0:
+                ax.set_title(f"t={t:.2f}", fontsize=12)
+            if c == 0:
+                ax.set_ylabel(f"img {r}, q=({qy},{qx})", fontsize=9)
+
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=320)
+    plt.close(fig)
+
+
+def build_fm_mask(U, LA, Vh, t, threshold=0.005, eps=1e-6):
+    sigma2 = ((1.0 - t) / t) ** 2
+
+    shrink = LA / (LA + sigma2)
+    LLt = U @ torch.diag(shrink) @ Vh
+
+    denom = torch.diagonal(LLt).unsqueeze(1)
+    denom = torch.where(denom.abs() < eps, torch.ones_like(denom), denom)
+
+    normalized = LLt / denom
+    mask = (normalized.abs() >= threshold).float()
+    return mask, normalized
+
+
+def main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("device:", device)
+
+    cfg = load_config(
+        "configs/wiener/fashion_mnist.yaml",
+        overrides=[
+            "metrics.wandb.enabled=false",
+            "dataset.batch_size=512",
+        ],
+    )
+
+    dataset = build_dataset(cfg.dataset)
+    wiener_path = Path("data/models/wiener/fashion_mnist_28")
+
+    if (wiener_path / "U.pt").exists():
+        print("Loading existing Wiener SVD...")
+        U, LA, Vh, mean = load_wiener_filter(wiener_path, device=device)
+    else:
+        print("Computing covariance and SVD...")
+        S, mean = compute_wiener_filter(
+            dataloader=dataset.dataloader,
+            device=device,
+            resolution=dataset.resolution,
+            n_channels=dataset.in_channels,
+        )
+        U, LA, Vh = torch.linalg.svd(S)
+        save_wiener_filter(U, LA, Vh, mean, wiener_path)
+
+    del mean
+
+    H = W = dataset.resolution
+    C = dataset.in_channels
+    n_images = 5
+
+    torch.manual_seed(42)
+    generator = torch.Generator(device=device).manual_seed(42)
+
+    first_batch = next(iter(dataset.dataloader))
+    images = first_batch[0] if isinstance(first_batch, (tuple, list)) else first_batch
+    x1_batch = images[:n_images].to(device)
+    x0_batch = torch.randn(x1_batch.shape, device=device, generator=generator)
+
+    q_positions = [
+        (H // 2, W // 2),
+        (H // 2 - 5, W // 2),
+        (H // 2 + 5, W // 2),
+        (H // 2, W // 2 - 5),
+        (H // 2, W // 2 + 5),
+    ]
+
+    t_values = [0.1, 0.3, 0.5, 0.7, 0.9]
+
+    out_dir = Path("experiments_tom/figures/fm_masks_fashion_mnist")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    plot_xt_trajectory_grid(
+        x0_batch=x0_batch,
+        x1_batch=x1_batch,
+        q_positions=q_positions,
+        t_values=t_values,
+        out_path=out_dir / "fm_xt_trajectory_grid.png",
+    )
+
+    masks_by_img_t = {}
+    sens_by_img_t = {}
+
+    for c, t in enumerate(t_values):
+        mask, normalized = build_fm_mask(U, LA, Vh, t)
+
+        for r, (qy, qx) in enumerate(q_positions):
+            q = qy * W + qx
+
+            mask_q = mask[q].reshape(C, H, W)[0].detach().cpu()
+            sens_q = normalized[q].abs().reshape(C, H, W)[0].detach().cpu()
+            sens_q = sens_q / (sens_q.max() + 1e-8)
+
+            masks_by_img_t[(r, c)] = mask_q
+            sens_by_img_t[(r, c)] = sens_q
+
+            print(
+                f"t={t:.2f} | img={r} | q=({qy},{qx}) | "
+                f"active pixels={int(mask_q.sum().item())}"
+            )
+
+    plot_sensitivity_heatmap_grid(
+        fields_by_img_t=sens_by_img_t,
+        q_positions=q_positions,
+        t_values=t_values,
+        out_path=out_dir / "fm_sensitivity_heatmap.png",
+        cmap="turbo",
+    )
+
+    plot_field_on_xt_grid(
+        x0_batch=x0_batch,
+        x1_batch=x1_batch,
+        fields_by_img_t=masks_by_img_t,
+        q_positions=q_positions,
+        t_values=t_values,
+        out_path=out_dir / "fm_binary_mask_on_xt.png",
+        cmap="viridis",
+        alpha=0.85,
+        mask_zeros=True,
+    )
+
+
+if __name__ == "__main__":
+    main()
